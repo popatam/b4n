@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /*
@@ -19,7 +19,7 @@ const HEADER_WO_SIGN_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 8 + 4;
 const TRX_CAPACITY_BYTES: usize = 32;
 
 trait Signer {
-    fn sign(&self, data: &[u8]) -> SignatureType;
+    fn sign(&self, data: &[u8]) -> Option<SignatureType>
 }
 
 trait Verifier {
@@ -85,7 +85,7 @@ struct PoAConsensusConfig {
     /// период повышения round
     timeout_ms: u64,
     /// max кол-во транзакций на блок, можно уйти от Vec<Transaction> в блоке, но пока оставлю так
-    max_trx_per_block: u32,
+    max_trx_per_block: usize,
 }
 
 struct PoAConsensusState {
@@ -172,10 +172,39 @@ struct BlockHeader {
     signature: SignatureType, // подпись пропосера, как реализовать (De)Serialize для этого типа?
 }
 
+impl BlockHeader {
+    fn new_genesis() -> Self {
+        let timestamp = UNIX_EPOCH
+            .duration_since(UNIX_EPOCH)
+            .expect("Back to the future!!!")
+            .as_secs();
+
+        Self {
+            version: VERSION,
+            index: 0,
+            previous_hash: Hash32Type::default(),
+            merkle_root: calc_hash(&[]),
+            timestamp,
+            round: 0,
+            proposer_id: 0,
+            signature: [0; 64],
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Block {
     header: BlockHeader,
     transactions: Vec<Transaction>,
+}
+
+impl Block {
+    fn new_genesis(genesis_header: BlockHeader) -> Self {
+        Self {
+            header: genesis_header,
+            transactions: Vec::with_capacity(0),
+        }
+    }
 }
 
 impl Block {
@@ -208,9 +237,10 @@ impl Block {
         }
     }
 
-    fn sign(&mut self, signer: &impl Signer) {
+    fn sign(&mut self, signer: &impl Signer, chain_id: u64) -> Result<(), SignError> {
         let header_data = self.header_wo_signature_to_bytes();
-        self.header.signature = signer.sign(&header_data);
+        self.header.signature = signer.sign(&header_data)?;
+        Ok(())
     }
 
     fn hash(&self) -> Hash32Type {
@@ -281,7 +311,7 @@ impl Block {
 }
 
 // Транзакция, содержится в блоке, содержит id, от кого, кому и дату созадния, по идее ещё и кол-во? Количество чего?
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Transaction {
     id: u64,
     from: u64, // не строка ли тут?
@@ -330,26 +360,9 @@ struct BlockChain {
 
 impl BlockChain {
     fn new() -> Self {
-        let timestamp = UNIX_EPOCH
-            .duration_since(UNIX_EPOCH)
-            .expect("Back to the future!!!")
-            .as_secs();
-
-        let genesis_header = BlockHeader {
-            version: VERSION,
-            index: 0,
-            previous_hash: Hash32Type::default(),
-            merkle_root: calc_hash(&[]),
-            timestamp,
-            round: 0,
-            proposer_id: 0,
-            signature: [0; 64],
-        };
-
-        let genesis_block = Block {
-            header: genesis_header,
-            transactions: Vec::with_capacity(0),
-        }; // базовый блок, исключителен, т.к. не содержит ссылки не предыдущий
+        let genesis_header = BlockHeader::new_genesis();
+        // базовый блок, исключителен, т.к. не содержит ссылки не предыдущий
+        let genesis_block = Block::new_genesis(genesis_header);
         BlockChain {
             blocks: vec![genesis_block],
         }
@@ -365,7 +378,7 @@ impl BlockChain {
         let last_block = &self.blocks[last_id];
         let next_id = last_block.header.index + 1;
         let prev_hash = last_block.hash();
-        let round = 0; // как менять round??
+        let round = 0; // FIXME как менять round??
 
         let mut new_block =
             Block::build_unsigned(next_id, prev_hash, transactions, round, proposer_id);
@@ -374,7 +387,7 @@ impl BlockChain {
         self.blocks.push(new_block);
     }
 
-    fn is_valid(&self, consensus: &PoAConsensusConfig, verifier: &impl Verifier) -> bool {
+    fn is_valid(&self) -> bool {
         for block_window in self.blocks.windows(2) {
             let [prev_block, cur_block] = block_window else {
                 unreachable!();
@@ -393,22 +406,23 @@ impl BlockChain {
                 return false;
             }
 
-            // проверка пропозера
-            let (proposer_id, expected_proposer) =
-                consensus.expected_proposer(cur_block.header.index, cur_block.header.round);
-            if cur_block.header.proposer_id != proposer_id {
-                return false;
-            }
-
-            // проверка подписи в конце, т.к. дороже
-            let data = cur_block.header_wo_signature_to_bytes();
-            if !verifier.verify(
-                &expected_proposer.pubkey,
-                &data,
-                &cur_block.header.signature,
-            ) {
-                return false;
-            };
+            // FIXME перенести в консенсус?
+            // // проверка пропозера
+            // let (proposer_id, expected_proposer) =
+            //     consensus.expected_proposer(cur_block.header.index, cur_block.header.round);
+            // if cur_block.header.proposer_id != proposer_id {
+            //     return false;
+            // }
+            //
+            // // проверка подписи в конце, т.к. дороже
+            // let data = cur_block.header_wo_signature_to_bytes();
+            // if !verifier.verify(
+            //     &expected_proposer.pubkey,
+            //     &data,
+            //     &cur_block.header.signature,
+            // ) {
+            //     return false;
+            // };
         }
         true
     }
@@ -430,6 +444,153 @@ impl BlockChain {
     }
 }
 
+struct PoAConsensus {
+    config: PoAConsensusConfig,
+    state: PoAConsensusState,
+}
+
+impl PoAConsensus {
+    pub(crate) fn get_current_round(&self) -> u64 {
+        self.state.current_round
+    }
+}
+
+impl PoAConsensus {
+    fn new(config: PoAConsensusConfig, state: PoAConsensusState) -> Self {
+        Self { config, state }
+    }
+}
+
+// struct NodeConfig {
+//     private_key: [u8; 32],
+// }
+
+struct MemPool {
+    /// очередь транзакиций на добавление в блок
+    queue: VecDeque<Transaction>,
+    /// сет прошедших транзакций
+    seen: HashSet<Hash32Type>,
+}
+
+impl MemPool {
+    fn push(&mut self, transaction: Transaction) -> bool {
+        let transaction_hash = transaction.hash();
+        if self.seen.contains(&transaction_hash) {
+            return false;
+        }
+
+        self.seen.insert(transaction_hash);
+        self.queue.push_back(transaction);
+        true
+    }
+
+    fn pop_many(&mut self, count: usize) -> Vec<Transaction> {
+        let n = count.min(self.queue.len());
+        self.queue.drain(..n).collect()
+    }
+}
+
+struct NodeIdentity {
+    /// публичный ключ ноды
+    pubkey: PubkeyType,
+
+    /// приватный ключ (если валидатор)
+    private_key: Option<SigningKey>,
+
+    /// порядковый номер (если валидатор)
+    node_id: Option<u32>,
+}
+
+impl NodeIdentity {
+    // seed нужен в любом случае, если нет в валидаторах, то будет обычным узлом
+    fn new(seed: [u8; 32], consensus_config: &PoAConsensusConfig) -> Self {
+        let signing_key = SigningKey::from_bytes(&seed);
+        let pubkey = signing_key.verifying_key().to_bytes();
+
+        let node_id = consensus_config
+            .validators
+            .iter()
+            .position(|v| v.pubkey == pubkey)
+            .map(|idx| idx as u32);
+
+        Self {
+            pubkey,
+            private_key: Some(signing_key),
+            node_id,
+        }
+    }
+
+    fn is_validator(&self) -> bool {
+        self.private_key.is_some() && self.node_id.is_some()
+    }
+
+    fn node_id(&self) -> Option<u32> {
+        self.node_id
+    }
+}
+
+impl Signer for NodeIdentity {
+    fn sign(&self, data: &[u8]) -> Option<SignatureType> {
+        self.private_key
+            .as_ref()
+            .map(|private_key| private_key.sign(data).to_bytes())
+    }
+}
+
+struct Node {
+    identity: NodeIdentity,
+    chain: BlockChain,
+    mempool: MemPool,
+    consensus: PoAConsensus,
+}
+
+enum NetMessage {
+    Trx(Transaction),
+    Block(Block),
+}
+impl Node {
+    fn on_message(&mut self, message: NetMessage) {
+        match message {
+            NetMessage::Trx(message) => {
+                self.mempool.push(message);
+            }
+            NetMessage::Block(message) => {
+                // FIXME
+                // validate chain
+                // validate consensus
+                // append to chain
+            }
+        }
+    }
+
+    fn build_block(&mut self, transactions: Vec<Transaction>) -> Option<Block> {
+        let proposer_id = self.identity.node_id?;
+        let last_block = self.chain.last();
+        let next_block_id = last_block.header.index + 1;
+        let prev_hash = last_block.hash();
+        let round = self.consensus.get_current_round();
+
+        let mut new_block =
+            Block::build_unsigned(next_block_id, prev_hash, transactions, round, proposer_id);
+
+        new_block.sign(signer)?;
+
+        Some(new_block)
+    }
+
+    fn on_tick(&mut self) {
+        let transactions = self
+            .mempool
+            .pop_many(self.consensus.config.max_trx_per_block);
+
+        self.build_block(self.config.id, transactions, &self.config);
+    }
+
+    fn run_loop(&self) {
+        thread_spawn()
+    }
+}
+
 fn main() {
     let proposer_id1: u32 = 0;
     let proposer_id1_priv_key = [1u8; 32];
@@ -442,6 +603,19 @@ fn main() {
     let proposer_id3: u32 = 2;
     let proposer_id3_priv_key = [3u8; 32];
     let signer3 = Ed25519Signer::new_from_seed(proposer_id3_priv_key);
+
+    //
+    let mut chain = BlockChain::new();
+
+    let transaction = Transaction::new(0, 0, 0, 0);
+    let transaction1 = Transaction::new(0, 0, 0, 0);
+    let transaction2 = Transaction::new(0, 0, 0, 0);
+
+    chain.add_block(proposer_id1, vec![transaction], &signer1);
+    chain.add_block(proposer_id2, vec![transaction1], &signer2);
+    chain.add_block(proposer_id3, vec![transaction2], &signer3);
+
+    println!("{:#?}", chain);
 
     let validators = vec![
         Validator {
@@ -457,57 +631,38 @@ fn main() {
 
     let verifier = Ed25519Verifier;
 
-    //
-    let mut chain = BlockChain::new();
-
-    let transaction = Transaction::new(0, 0, 0, 0);
-    let transaction1 = Transaction::new(0, 0, 0, 0);
-    let transaction2 = Transaction::new(0, 0, 0, 0);
-
-    chain.add_block(proposer_id1, vec![transaction], &signer1);
-    chain.add_block(proposer_id2, vec![transaction1], &signer2);
-    chain.add_block(proposer_id3, vec![transaction2], &signer3);
-
-    println!("{:#?}", chain);
-
-
-
     let consensus_config = PoAConsensusConfig {
         validators,
         slot_duration_ms: 10_000,
         timeout_ms: 10_000,
         max_trx_per_block: 100,
     };
+    if !consensus_config.validate_config() {
+        panic!("Check consensus config!")
+    }
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_millis();
+
     let consensus_state = PoAConsensusState {
         current_height: chain.get_height(),
         current_round: chain.get_round(),
         round_started_at_ms: now,
     };
 
-    if !consensus_config.validate_config() {
-        panic!("Check consensus config!")
-    }
+    let consensus = PoAConsensus::new(consensus_config, consensus_state);
 
-    println!("{:#?}", chain.is_valid(&consensus_config, &verifier));
+    println!("{:#?}", chain.is_valid());
 
     //
     let b2 = chain.get_block(2).unwrap();
     println!("{:?}", b2);
 
     //
-    println!(
-        "valid before: {}",
-        chain.is_valid(&consensus_config, &verifier)
-    );
+    println!("valid before: {}", chain.is_valid());
     chain.blocks[1].transactions[0].amount = 999;
-    println!(
-        "valid after: {}",
-        chain.is_valid(&consensus_config, &verifier)
-    );
-    assert_eq!(chain.is_valid(&consensus_config, &verifier), false);
+    println!("valid after: {}", chain.is_valid());
+    assert_eq!(chain.is_valid(), false);
 }
