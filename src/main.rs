@@ -1,6 +1,7 @@
-use serde_big_array::BigArray;
 use serde::{Deserialize, Serialize};
+use serde_big_array::BigArray;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /*
@@ -9,16 +10,13 @@ nonce нужен только если proof of work
 
 */
 
-
-
 const VERSION: u32 = 0; // точно константа?
 type Hash32Type = [u8; 32];
 type PubkeyType = [u8; 32];
 type SignatureType = [u8; 64];
-const HEADER_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 4 + 4 + 64;
-const HEADER_WO_SIGN_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 4 + 4;
+const HEADER_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 8 + 4 + 64;
+const HEADER_WO_SIGN_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 8 + 4;
 const TRX_CAPACITY_BYTES: usize = 32;
-
 
 trait Signer {
     fn sign(&self, data: &[u8]) -> SignatureType;
@@ -28,11 +26,10 @@ trait Verifier {
     fn verify(&self, pubkey: &PubkeyType, data: &[u8], signature: &SignatureType) -> bool;
 }
 
-
-
 /// crypt
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Signer as DalekSigner, Verifier as DalekVerifier};
-
+use ed25519_dalek::{
+    Signature, Signer as DalekSigner, SigningKey, Verifier as DalekVerifier, VerifyingKey,
+};
 
 pub struct Ed25519Signer {
     /// приватыный ключ ed25519
@@ -42,7 +39,9 @@ pub struct Ed25519Signer {
 impl Ed25519Signer {
     /// создать из сида
     pub fn new_from_seed(seed: [u8; 32]) -> Self {
-        Self { signing_key: SigningKey::from_bytes(&seed) }
+        Self {
+            signing_key: SigningKey::from_bytes(&seed),
+        }
     }
 
     /// получить публичный ключ
@@ -59,10 +58,10 @@ impl Signer for Ed25519Signer {
 }
 
 /// Проверяет подпись по публичному ключу (Ed25519)
+#[derive(Default)]
 pub struct Ed25519Verifier;
 
 impl Verifier for Ed25519Verifier {
-
     /// проверяет подпись по публичному ключу ed25519
     fn verify(&self, pubkey: &PubkeyType, data: &[u8], signature: &SignatureType) -> bool {
         let vk = match VerifyingKey::from_bytes(pubkey) {
@@ -75,13 +74,11 @@ impl Verifier for Ed25519Verifier {
     }
 }
 
-
 struct Validator {
-    id: u32,
     pubkey: PubkeyType,
 }
 
-struct ConsensusParams {
+struct PoAConsensusConfig {
     validators: Vec<Validator>,
     /// сколько времени у proposer на сделать блок
     slot_duration_ms: u64,
@@ -89,6 +86,38 @@ struct ConsensusParams {
     timeout_ms: u64,
     /// max кол-во транзакций на блок, можно уйти от Vec<Transaction> в блоке, но пока оставлю так
     max_trx_per_block: u32,
+}
+
+struct PoAConsensusState {
+    current_height: u64,
+    current_round: u64,
+    round_started_at_ms: u128,
+}
+
+impl PoAConsensusConfig {
+    fn validate_config(&self) -> bool {
+        if self.validators.len() < 1 {
+            return false;
+        }
+
+        let uniq_pubkeys = self
+            .validators
+            .iter()
+            .map(|v| v.pubkey)
+            .collect::<HashSet<PubkeyType>>();
+        if uniq_pubkeys.len() != self.validators.len() {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn expected_proposer(&self, block_index: u64, round: u64) -> (u32, &Validator) {
+        let proposer_count = self.validators.len();
+        let proposer_index = (block_index - 1 + round) % proposer_count as u64; // -1 чтобы первый не genesis блок выписывался первым пропозером
+        let validator = &self.validators[proposer_index as usize];
+        (proposer_index as u32, validator)
+    }
 }
 
 // функций хеширования, sha256 норм
@@ -136,9 +165,9 @@ struct BlockHeader {
     index: u64, // он же height
     previous_hash: Hash32Type,
     merkle_root: Hash32Type,
-    timestamp: u64,           // как понимаю опционально или нет?
-    round: u32,               // номер попытки для текущего индекса (высоты)
-    proposer_id: u32,
+    timestamp: u64,   // как понимаю опционально или нет?
+    round: u64,       // номер попытки для текущего индекса (высоты)
+    proposer_id: u32, // порядковый номер валидатора в списке валидаторов (см. PoA консенсус)
     #[serde(with = "BigArray")]
     signature: SignatureType, // подпись пропосера, как реализовать (De)Serialize для этого типа?
 }
@@ -154,7 +183,7 @@ impl Block {
         index: u64,
         previous_hash: Hash32Type,
         transactions: Vec<Transaction>,
-        round: u32,
+        round: u64,
         proposer_id: u32,
     ) -> Block {
         let timestamp = SystemTime::now()
@@ -208,8 +237,8 @@ impl Block {
         buf[off..off + 8].copy_from_slice(&self.header.timestamp.to_be_bytes());
         off += 8;
 
-        buf[off..off + 4].copy_from_slice(&self.header.round.to_be_bytes());
-        off += 4;
+        buf[off..off + 8].copy_from_slice(&self.header.round.to_be_bytes());
+        off += 8;
 
         buf[off..off + 4].copy_from_slice(&self.header.proposer_id.to_be_bytes());
         off += 4;
@@ -220,7 +249,6 @@ impl Block {
         debug_assert!(off == HEADER_CAPACITY_BYTES);
         buf
     }
-
 
     fn header_wo_signature_to_bytes(&self) -> [u8; HEADER_WO_SIGN_CAPACITY_BYTES] {
         let mut buf = [0u8; HEADER_WO_SIGN_CAPACITY_BYTES];
@@ -241,8 +269,8 @@ impl Block {
         buf[off..off + 8].copy_from_slice(&self.header.timestamp.to_be_bytes());
         off += 8;
 
-        buf[off..off + 4].copy_from_slice(&self.header.round.to_be_bytes());
-        off += 4;
+        buf[off..off + 8].copy_from_slice(&self.header.round.to_be_bytes());
+        off += 8;
 
         buf[off..off + 4].copy_from_slice(&self.header.proposer_id.to_be_bytes());
         off += 4;
@@ -305,7 +333,7 @@ impl BlockChain {
         let timestamp = UNIX_EPOCH
             .duration_since(UNIX_EPOCH)
             .expect("Back to the future!!!")
-            .as_secs(); // плохо или норм?
+            .as_secs();
 
         let genesis_header = BlockHeader {
             version: VERSION,
@@ -327,33 +355,60 @@ impl BlockChain {
         }
     }
 
-    fn add_block(&mut self, proposer_id: u32, transactions: Vec<Transaction>, signer: &impl Signer) { // какой тип у private_key
+    fn add_block(
+        &mut self,
+        proposer_id: u32,
+        transactions: Vec<Transaction>,
+        signer: &impl Signer,
+    ) {
         let last_id = self.blocks.len() - 1;
         let last_block = &self.blocks[last_id];
         let next_id = last_block.header.index + 1;
         let prev_hash = last_block.hash();
         let round = 0; // как менять round??
 
-        let mut new_block = Block::build_unsigned(next_id, prev_hash, transactions, round, proposer_id);
+        let mut new_block =
+            Block::build_unsigned(next_id, prev_hash, transactions, round, proposer_id);
 
         new_block.sign(signer);
         self.blocks.push(new_block);
     }
 
-    fn is_valid(&self) -> bool {
+    fn is_valid(&self, consensus: &PoAConsensusConfig, verifier: &impl Verifier) -> bool {
         for block_window in self.blocks.windows(2) {
             let [prev_block, cur_block] = block_window else {
                 unreachable!();
             };
+
+            // проверка хэша хедера блока
             if cur_block.header.previous_hash != prev_block.hash() {
                 return false;
             }
+            // проверка индекса (высоты) блокчейна
             if cur_block.header.index != prev_block.header.index + 1 {
                 return false;
             }
+            // проверка хэша транзакций входящих в блок
             if cur_block.header.merkle_root != calc_merkle_root(&cur_block.transactions) {
                 return false;
             }
+
+            // проверка пропозера
+            let (proposer_id, expected_proposer) =
+                consensus.expected_proposer(cur_block.header.index, cur_block.header.round);
+            if cur_block.header.proposer_id != proposer_id {
+                return false;
+            }
+
+            // проверка подписи в конце, т.к. дороже
+            let data = cur_block.header_wo_signature_to_bytes();
+            if !verifier.verify(
+                &expected_proposer.pubkey,
+                &data,
+                &cur_block.header.signature,
+            ) {
+                return false;
+            };
         }
         true
     }
@@ -361,34 +416,98 @@ impl BlockChain {
     fn get_block(&self, index: u64) -> Option<&Block> {
         self.blocks.get(index as usize)
     }
+
+    fn last(&self) -> &Block {
+        &self.blocks[self.blocks.len() - 1]
+    }
+
+    fn get_height(&self) -> u64 {
+        self.last().header.index
+    }
+
+    fn get_round(&self) -> u64 {
+        self.last().header.round
+    }
 }
 
 fn main() {
+    let proposer_id1: u32 = 0;
+    let proposer_id1_priv_key = [1u8; 32];
+    let signer1 = Ed25519Signer::new_from_seed(proposer_id1_priv_key);
+
+    let proposer_id2: u32 = 1;
+    let proposer_id2_priv_key = [2u8; 32];
+    let signer2 = Ed25519Signer::new_from_seed(proposer_id2_priv_key);
+
+    let proposer_id3: u32 = 2;
+    let proposer_id3_priv_key = [3u8; 32];
+    let signer3 = Ed25519Signer::new_from_seed(proposer_id3_priv_key);
+
+    let validators = vec![
+        Validator {
+            pubkey: signer1.pubkey(),
+        },
+        Validator {
+            pubkey: signer2.pubkey(),
+        },
+        Validator {
+            pubkey: signer3.pubkey(),
+        },
+    ];
+
+    let verifier = Ed25519Verifier;
+
+    //
     let mut chain = BlockChain::new();
 
     let transaction = Transaction::new(0, 0, 0, 0);
     let transaction1 = Transaction::new(0, 0, 0, 0);
     let transaction2 = Transaction::new(0, 0, 0, 0);
-    let proposer_id: u32 = 1;
 
-    let seed = [0u8; 32];
-    let signer = Ed25519Signer::new_from_seed(seed);
-
-
-    chain.add_block(proposer_id,  vec![transaction], &signer);
-    chain.add_block(proposer_id, vec![transaction1], &signer);
-    chain.add_block(proposer_id, vec![transaction2], &signer);
+    chain.add_block(proposer_id1, vec![transaction], &signer1);
+    chain.add_block(proposer_id2, vec![transaction1], &signer2);
+    chain.add_block(proposer_id3, vec![transaction2], &signer3);
 
     println!("{:#?}", chain);
-    println!("{:#?}", chain.is_valid());
+
+
+
+    let consensus_config = PoAConsensusConfig {
+        validators,
+        slot_duration_ms: 10_000,
+        timeout_ms: 10_000,
+        max_trx_per_block: 100,
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis();
+    let consensus_state = PoAConsensusState {
+        current_height: chain.get_height(),
+        current_round: chain.get_round(),
+        round_started_at_ms: now,
+    };
+
+    if !consensus_config.validate_config() {
+        panic!("Check consensus config!")
+    }
+
+    println!("{:#?}", chain.is_valid(&consensus_config, &verifier));
 
     //
     let b2 = chain.get_block(2).unwrap();
     println!("{:?}", b2);
 
     //
-    println!("valid before: {}", chain.is_valid());
+    println!(
+        "valid before: {}",
+        chain.is_valid(&consensus_config, &verifier)
+    );
     chain.blocks[1].transactions[0].amount = 999;
-    println!("valid after: {}", chain.is_valid());
-    assert_eq!(chain.is_valid(), false);
+    println!(
+        "valid after: {}",
+        chain.is_valid(&consensus_config, &verifier)
+    );
+    assert_eq!(chain.is_valid(&consensus_config, &verifier), false);
 }
