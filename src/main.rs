@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 /*
 делаю proof of authority
@@ -80,6 +80,7 @@ impl Verifier for Ed25519Verifier {
     }
 }
 
+#[derive(Debug, Clone)]
 struct Validator {
     pubkey: PubkeyType,
 }
@@ -90,6 +91,7 @@ pub enum ConsensusError {
     GenesisNotAllowedHere,
 }
 
+#[derive(Debug, Clone)]
 struct PoAConsensusConfig {
     validators: Vec<Validator>,
     /// сколько времени у proposer на сделать блок
@@ -167,7 +169,7 @@ fn calc_merkle_root(transactions: &[Transaction]) -> Hash32Type {
 }
 
 ////
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct BlockHeader {
     version: u32,
     index: u64, // он же height
@@ -195,7 +197,7 @@ impl BlockHeader {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct Block {
     header: BlockHeader,
     transactions: Vec<Transaction>,
@@ -464,8 +466,7 @@ impl<V: Verifier> PoAConsensus<V> {
         self.state.current_round
     }
 
-
-    fn update_state(&mut self, height: Option<u64>, round: u64 ) {
+    fn update_state(&mut self, height: Option<u64>, round: u64) {
         if let Some(h) = height {
             self.state.current_height = h;
         }
@@ -584,15 +585,18 @@ struct Node<V: Verifier> {
     chain: BlockChain,
     mempool: MemPool,
     consensus: PoAConsensus<V>,
+    peers: Vec<Sender<NetMessage>>,
 }
 
 enum NetMessage {
     Trx(Transaction),
     Block(Block),
+    DebugPrint,
     Stop,
+    AddPeer(Sender<NetMessage>),
 }
 impl<V: Verifier> Node<V> {
-    pub fn new(seed: [u8; 32], chain: BlockChain, consensus: PoAConsensus<V>) -> Self {
+    pub fn new(seed: [u8; 32], chain: BlockChain, consensus: PoAConsensus<V>, peers: Vec<Sender<NetMessage>>) -> Self {
         let identity = NodeIdentity::new(seed, &consensus.config);
 
         let mempool = MemPool {
@@ -605,15 +609,30 @@ impl<V: Verifier> Node<V> {
             chain,
             mempool,
             consensus,
+            peers,
+        }
+    }
+
+    pub fn add_peer(&mut self, sender: Sender<NetMessage>) {
+        // разобраться как работать с дублями в контексте Sender
+        self.peers.push(sender);
+    }
+
+    fn broancast_block(&self, block: &Block) {
+        for peer in &self.peers {
+            // тут вероятно что то умнее надо, на сейчас игнор если не получилось отправить
+            let _ = peer.send(NetMessage::Block(block.clone()));
         }
     }
 
     fn on_message(&mut self, message: NetMessage) {
         match message {
-            NetMessage::Trx(trx) => { // прилетела транзакция
+            NetMessage::Trx(trx) => {
+                // прилетела транзакция
                 self.mempool.push(trx);
             }
-            NetMessage::Block(block) => { // прилетел блок
+            NetMessage::Block(block) => {
+                // прилетел блок
                 // validate chain
                 let expected_index = self.chain.get_height() + 1;
                 if block.header.index != expected_index {
@@ -634,7 +653,11 @@ impl<V: Verifier> Node<V> {
                 let height = self.chain.get_height();
                 self.consensus.update_state(Some(height), 0);
             }
+            NetMessage::DebugPrint => {
+                println!("{:?}", self.chain)
+            }
             NetMessage::Stop => {} // graceful shutdown
+            NetMessage::AddPeer(sender) => { self.add_peer(sender); }
         }
     }
 
@@ -655,6 +678,8 @@ impl<V: Verifier> Node<V> {
     // выполняется если нет сообщений
     pub fn on_tick(&mut self) {
         // плохо, путано, потом переделать
+
+        // подготовка консенсуса
         let elapsed = self.consensus.state.round_started_at.elapsed();
         if elapsed >= Duration::from_millis(self.consensus.config.timeout_ms) {
             // плохо
@@ -666,32 +691,41 @@ impl<V: Verifier> Node<V> {
         let round = self.consensus.state.current_round;
         let (expected_proposer_id, _) = self.consensus.expected_proposer(next_height, round);
 
+        //
         if self.identity.node_id() != Some(expected_proposer_id) {
             // я не я, очередь не моя
             return;
         }
 
+        // подготовка транзакций
         let txs = self.mempool.pop_many(self.consensus.config.max_trx_per_block);
         if txs.is_empty() {
             // пустой блок без транзакций нельзя на всякий случай
             return;
         }
 
+        // создание блока
         let candidate = match self.build_block(txs) {
             Ok(b) => b,
             Err(_) => return, // не валидатор / нет ключа
         };
 
+        // валидация блока
         let prev = self.chain.last();
         if self.consensus.validate_block(prev, &candidate).is_err() {
             // кандидат не проходит правила консенсуса, не принимаем
             return;
         }
 
-        self.chain.blocks.push(candidate);
+        // непосредственно добавление
+        self.chain.blocks.push(candidate.clone());
 
+        // обновление состояния консенсуса
         let cur_height = self.chain.get_height();
         self.consensus.update_state(Some(cur_height), 0);
+
+        // раскидать соседям
+        self.broancast_block(&candidate);
     }
 
     // основной цикл работы ноды
@@ -734,30 +768,13 @@ fn spawn_node<V: Verifier + Send + 'static>(mut node: Node<V>) -> (Sender<NetMes
 }
 
 fn main() {
-    let proposer_id1: u32 = 0;
-    let proposer_id1_priv_key = [1u8; 32];
-    let signer1 = Ed25519Signer::new_from_seed(proposer_id1_priv_key);
+    let seed1 = [1u8; 32];
+    let seed2 = [2u8; 32];
+    let seed3 = [3u8; 32];
 
-    let proposer_id2: u32 = 1;
-    let proposer_id2_priv_key = [2u8; 32];
-    let signer2 = Ed25519Signer::new_from_seed(proposer_id2_priv_key);
-
-    let proposer_id3: u32 = 2;
-    let proposer_id3_priv_key = [3u8; 32];
-    let signer3 = Ed25519Signer::new_from_seed(proposer_id3_priv_key);
-
-    //
-    let mut chain = BlockChain::new();
-
-    let transaction = Transaction::new(0, 0, 0, 0);
-    let transaction1 = Transaction::new(0, 0, 0, 0);
-    let transaction2 = Transaction::new(0, 0, 0, 0);
-
-    chain.add_block(proposer_id1, vec![transaction], &signer1);
-    chain.add_block(proposer_id2, vec![transaction1], &signer2);
-    chain.add_block(proposer_id3, vec![transaction2], &signer3);
-
-    println!("{:#?}", chain);
+    let signer1 = Ed25519Signer::new_from_seed(seed1);
+    let signer2 = Ed25519Signer::new_from_seed(seed2);
+    let signer3 = Ed25519Signer::new_from_seed(seed3);
 
     let validators = vec![
         Validator {
@@ -771,40 +788,71 @@ fn main() {
         },
     ];
 
-    let verifier = Ed25519Verifier;
-
     let consensus_config = PoAConsensusConfig {
         validators,
         slot_duration_ms: 10_000,
         timeout_ms: 10_000,
         max_trx_per_block: 100,
     };
-    if !consensus_config.validate_config() {
-        panic!("Check consensus config!")
-    }
+    assert!(consensus_config.validate_config());
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards")
-        .as_millis();
+    //
+    let chain1 = BlockChain::new(1);
+    let chain2 = BlockChain::new(1);
+    let chain3 = BlockChain::new(1);
 
-    let consensus_state = PoAConsensusState {
-        current_height: chain.get_height(),
-        current_round: chain.get_round(),
-        round_started_at_ms: now,
+    let verifier1 = Ed25519Verifier;
+    let verifier2 = Ed25519Verifier;
+    let verifier3 = Ed25519Verifier;
+
+    let state1 = PoAConsensusState {
+        current_height: chain1.get_height(),
+        current_round: chain1.get_round(),
+        round_started_at: Instant::now(),
+    };
+    let state2 = PoAConsensusState {
+        current_height: chain2.get_height(),
+        current_round: chain2.get_round(),
+        round_started_at: Instant::now(),
+    };
+    let state3 = PoAConsensusState {
+        current_height: chain3.get_height(),
+        current_round: chain3.get_round(),
+        round_started_at: Instant::now(),
     };
 
-    let consensus = PoAConsensus::new(consensus_config, consensus_state);
+    let consensus1 = PoAConsensus::new(consensus_config.clone(), state1, verifier1).unwrap();
+    let consensus2 = PoAConsensus::new(consensus_config.clone(), state2, verifier2).unwrap();
+    let consensus3 = PoAConsensus::new(consensus_config.clone(), state3, verifier3).unwrap();
 
-    println!("{:#?}", chain.is_valid());
+    let node1 = Node::new(seed1, chain1, consensus1, vec![]);
+    let node2 = Node::new(seed2, chain2, consensus2, vec![]);
+    let node3 = Node::new(seed3, chain3, consensus3, vec![]);
+
+    let (tx1, h1) = spawn_node(node1);
+    let (tx2, h2) = spawn_node(node2);
+    let (tx3, h3) = spawn_node(node3);
 
     //
-    let b2 = chain.get_block(2).unwrap();
-    println!("{:?}", b2);
+    let _ = tx1.send(NetMessage::AddPeer(tx2.clone()));
+    let _ = tx2.send(NetMessage::AddPeer(tx1.clone()));
+    let _ = tx3.send(NetMessage::AddPeer(tx2.clone()));
 
-    //
-    println!("valid before: {}", chain.is_valid());
-    chain.blocks[1].transactions[0].amount = 999;
-    println!("valid after: {}", chain.is_valid());
-    assert_eq!(chain.is_valid(), false);
+
+    let _ = tx1.send(NetMessage::Trx(Transaction::new(1, 0, 0, 0)));
+    let _ = tx2.send(NetMessage::Trx(Transaction::new(2, 0, 0, 0)));
+    let _ = tx3.send(NetMessage::Trx(Transaction::new(3, 0, 0, 0)));
+
+    thread::sleep(Duration::from_secs(2));
+    let _ = tx1.send(NetMessage::DebugPrint);
+    let _ = tx2.send(NetMessage::DebugPrint);
+    let _ = tx3.send(NetMessage::DebugPrint);
+
+    let _ = tx1.send(NetMessage::Stop);
+    let _ = tx2.send(NetMessage::Stop);
+    let _ = tx3.send(NetMessage::Stop);
+
+    let _ = h1.join();
+    let _ = h2.join();
+    let _ = h3.join();
 }
