@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -12,7 +12,7 @@ nonce нужен только если proof of work
 
 */
 
-const VERSION: u32 = 0; // точно константа?
+const VERSION: u32 = 0;
 type Hash32Type = [u8; 32];
 type PubkeyType = [u8; 32];
 type SignatureType = [u8; 64];
@@ -34,7 +34,6 @@ trait Verifier {
 }
 
 /// crypt
-use ed25519_dalek::ed25519::SignatureEncoding;
 use ed25519_dalek::{Signature, Signer as DalekSigner, SigningKey, Verifier as DalekVerifier, VerifyingKey};
 
 pub struct Ed25519Signer {
@@ -581,22 +580,56 @@ impl Signer for NodeIdentity {
 }
 
 struct Node<V: Verifier> {
+    /// сетевой id ноды, по идее можно заменить открытым ключом
+    net_id: u32,
+
     identity: NodeIdentity,
     chain: BlockChain,
     mempool: MemPool,
     consensus: PoAConsensus<V>,
-    peers: Vec<Sender<NetMessage>>,
+    peers: HashMap<u32, Sender<NetMessage>>,
+
+    // сюда ли?
+    seen_blocks: HashSet<Hash32Type>,
+    orphans_by_prev: HashMap<Hash32Type, Vec<Block>>,
+    is_syncing: bool,
+    last_sync_from: Option<u64>,
 }
 
 enum NetMessage {
+    //
+    GetStatus {
+        from: u32,
+    },
+    Status {
+        from: u32,
+        height: u64,
+        last_block_hash: Hash32Type,
+    },
+    //
+    GetBlocks {
+        from: u32,
+        start: u64,
+        limit: u32,
+    },
+    Blocks {
+        from: u32,
+        blocks: Vec<Block>,
+    },
     Trx(Transaction),
     Block(Block),
+    //
     DebugPrint,
     Stop,
-    AddPeer(Sender<NetMessage>),
+
+    AddPeer {
+        peer_id: u32,
+        sender: Sender<NetMessage>,
+    },
 }
+
 impl<V: Verifier> Node<V> {
-    pub fn new(seed: [u8; 32], chain: BlockChain, consensus: PoAConsensus<V>, peers: Vec<Sender<NetMessage>>) -> Self {
+    pub fn new(net_id: u32, seed: [u8; 32], chain: BlockChain, consensus: PoAConsensus<V>) -> Self {
         let identity = NodeIdentity::new(seed, &consensus.config);
 
         let mempool = MemPool {
@@ -605,21 +638,27 @@ impl<V: Verifier> Node<V> {
         };
 
         Self {
+            net_id,
             identity,
             chain,
             mempool,
             consensus,
-            peers,
+            peers: HashMap::new(),
+
+            seen_blocks: HashSet::new(),
+            orphans_by_prev: HashMap::new(),
+            is_syncing: false,
+            last_sync_from: None,
         }
     }
 
-    pub fn add_peer(&mut self, sender: Sender<NetMessage>) {
+    pub fn add_peer(&mut self, peer_id: u32, sender: Sender<NetMessage>) {
         // разобраться как работать с дублями в контексте Sender
-        self.peers.push(sender);
+        self.peers.insert(peer_id, sender);
     }
 
     fn broancast_block(&self, block: &Block) {
-        for peer in &self.peers {
+        for peer in self.peers.values() {
             // тут вероятно что то умнее надо, на сейчас игнор если не получилось отправить
             let _ = peer.send(NetMessage::Block(block.clone()));
         }
@@ -628,37 +667,145 @@ impl<V: Verifier> Node<V> {
     fn on_message(&mut self, message: NetMessage) {
         match message {
             NetMessage::Trx(trx) => {
-                // прилетела транзакция
-                self.mempool.push(trx);
+                // прилетела транзакция, положить в пул, разослать дальше
+                let is_inserted = self.mempool.push(trx.clone());
+                if is_inserted {
+                    self.gossip_data(NetMessage::Trx(trx));
+                }
             }
+
             NetMessage::Block(block) => {
-                // прилетел блок
-                // validate chain
-                let expected_index = self.chain.get_height() + 1;
-                if block.header.index != expected_index {
-                    // по взрослому тут должна быть какая то логика
-                    return;
+                let progressed = self.handle_incoming_block(block);
+                if progressed {
+                    self.try_connect_orphans();
                 }
-
-                // validate consensus
-                let prev = self.chain.last();
-                if self.consensus.validate_block(prev, &block).is_err() {
-                    return;
-                }
-
-                // append to chain
-                self.chain.add_block(block);
-
-                // update consensus state
-                let height = self.chain.get_height();
-                self.consensus.update_state(Some(height), 0);
             }
+
+            NetMessage::Blocks { from: _from, blocks } => {
+                let mut progressed = false;
+                for b in blocks {
+                    progressed |= self.handle_incoming_block(b);
+                }
+
+                if progressed {
+                    self.try_connect_orphans();
+                }
+                self.is_syncing = false;
+                self.last_sync_from = None;
+            }
+
+            NetMessage::GetBlocks { from, start, limit } => {
+                let mut blocks = Vec::new();
+                let mut desired_height = start;
+                let to = start.saturating_add(limit as u64);
+
+                while desired_height < to {
+                    if let Some(b) = self.chain.get_block(desired_height) {
+                        blocks.push(b.clone());
+                        desired_height += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                if let Some(peer) = self.peers.get(&from) {
+                    let _ = peer.send(NetMessage::Blocks {
+                        from: self.net_id,
+                        blocks,
+                    });
+                }
+            }
+
+            NetMessage::GetStatus { from } => {
+                let height = self.chain.get_height();
+                let last_block_hash = self.chain.last().hash();
+
+                if let Some(peer) = self.peers.get(&from) {
+                    let _ = peer.send(NetMessage::Status {
+                        from: self.net_id,
+                        height,
+                        last_block_hash,
+                    });
+                }
+            }
+
+            NetMessage::Status {
+                height: peer_height, ..
+            } => {
+                let own_height = self.chain.get_height();
+                if peer_height > own_height {
+                    self.start_sync(own_height + 1);
+                }
+            }
+
             NetMessage::DebugPrint => {
                 println!("{:?}", self.chain)
             }
+
             NetMessage::Stop => {} // graceful shutdown
-            NetMessage::AddPeer(sender) => { self.add_peer(sender); }
+
+            NetMessage::AddPeer { peer_id, sender } => {
+                self.add_peer(peer_id, sender);
+
+                // подключился новый peer, меняемся статусами
+                if let Some(peer) = self.peers.get(&peer_id) {
+                    let _ = peer.send(NetMessage::GetStatus { from: self.net_id });
+
+                    let height = self.chain.get_height();
+                    let last_block_hash = self.chain.last().hash();
+                    let _ = peer.send(NetMessage::Status {
+                        from: self.net_id,
+                        height,
+                        last_block_hash,
+                    });
+                }
+            }
         }
+    }
+
+    fn handle_incoming_block(&mut self, block: Block) -> bool {
+        if !self.seen_blocks.insert(block.hash()) {
+            // уже видели, пропускаем
+            return false;
+        }
+
+        let own_height = self.chain.get_height();
+        let expected_index = own_height + 1;
+
+        if block.header.index <= own_height {
+            // блок старый, пропускаем
+            return false;
+        }
+
+        // если блок следующий цепляем
+        if block.header.index == expected_index {
+            let prev = self.chain.last();
+            // валидация по хешу, если не прошла, либо chain попердолило, либо форк
+            if block.header.previous_hash != prev.hash() {
+                self.put_orphan(block);
+                self.start_sync(expected_index);
+                return false;
+            }
+
+            if self.consensus.validate_block(prev, &block).is_err() {
+                // валидация по консенсусу, если не прошла, значит нас хотят обмануть
+                return false;
+            }
+
+            // добавление блока, обновление state консенсуса, рассылка дальше
+            self.chain.add_block(block);
+            let height = self.chain.get_height();
+            self.consensus.update_state(Some(height), 0);
+
+            let last_block = self.chain.last().clone();
+            self.gossip_data(NetMessage::Block(last_block));
+            return true;
+        }
+
+        // блок выше, отстаём, нужна синхронизация
+        self.put_orphan(block);
+        self.start_sync(expected_index);
+        false
     }
 
     fn build_block(&mut self, transactions: Vec<Transaction>) -> Result<Block, SignError> {
@@ -678,6 +825,11 @@ impl<V: Verifier> Node<V> {
     // выполняется если нет сообщений
     pub fn on_tick(&mut self) {
         // плохо, путано, потом переделать
+
+        if self.is_syncing {
+            // идёт синхронизация, сидим курим
+            return;
+        }
 
         // подготовка консенсуса
         let elapsed = self.consensus.state.round_started_at.elapsed();
@@ -718,7 +870,7 @@ impl<V: Verifier> Node<V> {
         }
 
         // непосредственно добавление
-        self.chain.blocks.push(candidate.clone());
+        self.chain.add_block(candidate.clone());
 
         // обновление состояния консенсуса
         let cur_height = self.chain.get_height();
@@ -754,6 +906,70 @@ impl<V: Verifier> Node<V> {
                     // источник сообщений умер?
                     break;
                 }
+            }
+        }
+    }
+
+    fn gossip_data(&self, msg: NetMessage) {
+        // пока передача всем, переделать!
+        for peer in self.peers.values() {
+            let _ = peer.send(match &msg {
+                NetMessage::Trx(t) => NetMessage::Trx(t.clone()),
+                NetMessage::Block(b) => NetMessage::Block(b.clone()),
+                _ => continue,
+            });
+        }
+    }
+
+    fn start_sync(&mut self, from_height: u64) {
+        if self.is_syncing && self.last_sync_from == Some(from_height) {
+            return;
+        }
+        self.is_syncing = true;
+        self.last_sync_from = Some(from_height);
+
+        // запрос недостающих блоков
+        let limit: u32 = 256;
+        for peer in self.peers.values() {
+            let _ = peer.send(NetMessage::GetBlocks {
+                from: self.net_id,
+                start: from_height,
+                limit,
+            });
+        }
+    }
+
+    fn put_orphan(&mut self, block: Block) {
+        self.orphans_by_prev.entry(block.header.previous_hash).or_default().push(block);
+    }
+
+    // попытаться подключить бесхозные блоки
+    fn try_connect_orphans(&mut self) {
+        loop {
+            let last_block_hash = self.chain.last().hash();
+            let Some(mut vec) = self.orphans_by_prev.remove(&last_block_hash) else {
+                break;
+            };
+
+            let mut changed = false;
+            for block in vec.drain(..) {
+                let prev = self.chain.last();
+                if self.consensus.validate_block(prev, &block).is_ok() {
+                    // FIXME везде одно и то же при добавлении блока, можно объединить
+                    self.chain.add_block(block);
+                    let height = self.chain.get_height();
+                    self.consensus.update_state(Some(height), 0);
+                    changed = true;
+
+                    let last_block = self.chain.last().clone();
+                    self.gossip_data(NetMessage::Block(last_block));
+                    break;
+                }
+            }
+
+            if !changed {
+                // ничего не прицепить
+                break;
             }
         }
     }
@@ -825,19 +1041,27 @@ fn main() {
     let consensus2 = PoAConsensus::new(consensus_config.clone(), state2, verifier2).unwrap();
     let consensus3 = PoAConsensus::new(consensus_config.clone(), state3, verifier3).unwrap();
 
-    let node1 = Node::new(seed1, chain1, consensus1, vec![]);
-    let node2 = Node::new(seed2, chain2, consensus2, vec![]);
-    let node3 = Node::new(seed3, chain3, consensus3, vec![]);
+    let node1 = Node::new(1, seed1, chain1, consensus1);
+    let node2 = Node::new(2, seed2, chain2, consensus2);
+    let node3 = Node::new(3, seed3, chain3, consensus3);
 
     let (tx1, h1) = spawn_node(node1);
     let (tx2, h2) = spawn_node(node2);
     let (tx3, h3) = spawn_node(node3);
 
     //
-    let _ = tx1.send(NetMessage::AddPeer(tx2.clone()));
-    let _ = tx2.send(NetMessage::AddPeer(tx1.clone()));
-    let _ = tx3.send(NetMessage::AddPeer(tx2.clone()));
-
+    let _ = tx1.send(NetMessage::AddPeer {
+        peer_id: 2,
+        sender: tx2.clone(),
+    });
+    let _ = tx2.send(NetMessage::AddPeer {
+        peer_id: 1,
+        sender: tx1.clone(),
+    });
+    let _ = tx3.send(NetMessage::AddPeer {
+        peer_id: 2,
+        sender: tx2.clone(),
+    });
 
     let _ = tx1.send(NetMessage::Trx(Transaction::new(1, 0, 0, 0)));
     let _ = tx2.send(NetMessage::Trx(Transaction::new(2, 0, 0, 0)));
