@@ -2,7 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /*
 делаю proof of authority
@@ -18,8 +20,13 @@ const HEADER_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 8 + 4 + 64;
 const HEADER_WO_SIGN_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 8 + 4;
 const TRX_CAPACITY_BYTES: usize = 32;
 
+#[derive(Debug)]
+enum SignError {
+    NotValidator,
+}
+
 trait Signer {
-    fn sign(&self, data: &[u8]) -> Option<SignatureType>
+    fn sign(&self, data: &[u8]) -> Result<SignatureType, SignError>;
 }
 
 trait Verifier {
@@ -27,9 +34,8 @@ trait Verifier {
 }
 
 /// crypt
-use ed25519_dalek::{
-    Signature, Signer as DalekSigner, SigningKey, Verifier as DalekVerifier, VerifyingKey,
-};
+use ed25519_dalek::ed25519::SignatureEncoding;
+use ed25519_dalek::{Signature, Signer as DalekSigner, SigningKey, Verifier as DalekVerifier, VerifyingKey};
 
 pub struct Ed25519Signer {
     /// приватыный ключ ed25519
@@ -51,9 +57,9 @@ impl Ed25519Signer {
 }
 
 impl Signer for Ed25519Signer {
-    fn sign(&self, data: &[u8]) -> SignatureType {
+    fn sign(&self, data: &[u8]) -> Result<SignatureType, SignError> {
         let sig: Signature = self.signing_key.sign(data);
-        sig.to_bytes()
+        Ok(sig.to_bytes())
     }
 }
 
@@ -78,6 +84,12 @@ struct Validator {
     pubkey: PubkeyType,
 }
 
+#[derive(Debug)]
+pub enum ConsensusError {
+    InvalidConfig,
+    GenesisNotAllowedHere,
+}
+
 struct PoAConsensusConfig {
     validators: Vec<Validator>,
     /// сколько времени у proposer на сделать блок
@@ -89,9 +101,12 @@ struct PoAConsensusConfig {
 }
 
 struct PoAConsensusState {
+    /// текущий последний индекс блока
     current_height: u64,
+    /// текущий раунд (попытка вписать блок)
     current_round: u64,
-    round_started_at_ms: u128,
+    /// время старта раунда
+    round_started_at: Instant,
 }
 
 impl PoAConsensusConfig {
@@ -110,13 +125,6 @@ impl PoAConsensusConfig {
         }
 
         true
-    }
-
-    pub fn expected_proposer(&self, block_index: u64, round: u64) -> (u32, &Validator) {
-        let proposer_count = self.validators.len();
-        let proposer_index = (block_index - 1 + round) % proposer_count as u64; // -1 чтобы первый не genesis блок выписывался первым пропозером
-        let validator = &self.validators[proposer_index as usize];
-        (proposer_index as u32, validator)
     }
 }
 
@@ -174,17 +182,12 @@ struct BlockHeader {
 
 impl BlockHeader {
     fn new_genesis() -> Self {
-        let timestamp = UNIX_EPOCH
-            .duration_since(UNIX_EPOCH)
-            .expect("Back to the future!!!")
-            .as_secs();
-
         Self {
             version: VERSION,
             index: 0,
             previous_hash: Hash32Type::default(),
             merkle_root: calc_hash(&[]),
-            timestamp,
+            timestamp: 0,
             round: 0,
             proposer_id: 0,
             signature: [0; 64],
@@ -205,6 +208,16 @@ impl Block {
             transactions: Vec::with_capacity(0),
         }
     }
+}
+
+#[derive(Debug)]
+pub enum BlockError {
+    GenesisNotAllowedHere,
+    InvalidIndex { expected: u64, got: u64 },
+    InvalidPrevHash,
+    InvalidMerkleRoot,
+    InvalidProposer { expected: u32, got: u32 },
+    InvalidSignature,
 }
 
 impl Block {
@@ -231,13 +244,10 @@ impl Block {
             signature: [0; 64], // временно
         };
 
-        Block {
-            header,
-            transactions,
-        }
+        Block { header, transactions }
     }
 
-    fn sign(&mut self, signer: &impl Signer, chain_id: u64) -> Result<(), SignError> {
+    fn sign(&mut self, signer: &impl Signer) -> Result<(), SignError> {
         let header_data = self.header_wo_signature_to_bytes();
         self.header.signature = signer.sign(&header_data)?;
         Ok(())
@@ -308,9 +318,34 @@ impl Block {
         debug_assert!(off == HEADER_WO_SIGN_CAPACITY_BYTES);
         buf
     }
+
+    pub fn validate(&self, prev: &Block) -> Result<(), BlockError> {
+        if self.header.index == 0 {
+            return Err(BlockError::GenesisNotAllowedHere);
+        }
+
+        let expected_index = prev.header.index + 1;
+        if self.header.index != expected_index {
+            return Err(BlockError::InvalidIndex {
+                expected: expected_index,
+                got: self.header.index,
+            });
+        }
+
+        if self.header.previous_hash != prev.hash() {
+            return Err(BlockError::InvalidPrevHash);
+        }
+
+        let expected_merkle = calc_merkle_root(&self.transactions);
+        if self.header.merkle_root != expected_merkle {
+            return Err(BlockError::InvalidMerkleRoot);
+        }
+
+        Ok(())
+    }
 }
 
-// Транзакция, содержится в блоке, содержит id, от кого, кому и дату созадния, по идее ещё и кол-во? Количество чего?
+// Транзакция, содержится в блоке, содержит id, от кого, кому и дату созадния, по идее ещё полезную ангрузку
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Transaction {
     id: u64,
@@ -322,12 +357,7 @@ struct Transaction {
 
 impl Transaction {
     fn new(id: u64, from: u64, to: u64, amount: u64) -> Transaction {
-        Transaction {
-            id,
-            from,
-            to,
-            amount,
-        }
+        Transaction { id, from, to, amount }
     }
 
     fn hash(&self) -> Hash32Type {
@@ -355,36 +385,23 @@ impl Transaction {
 
 #[derive(Debug, Serialize)]
 struct BlockChain {
+    chain_id: u64,
     blocks: Vec<Block>,
 }
 
 impl BlockChain {
-    fn new() -> Self {
+    fn new(chain_id: u64) -> Self {
         let genesis_header = BlockHeader::new_genesis();
         // базовый блок, исключителен, т.к. не содержит ссылки не предыдущий
         let genesis_block = Block::new_genesis(genesis_header);
         BlockChain {
+            chain_id,
             blocks: vec![genesis_block],
         }
     }
 
-    fn add_block(
-        &mut self,
-        proposer_id: u32,
-        transactions: Vec<Transaction>,
-        signer: &impl Signer,
-    ) {
-        let last_id = self.blocks.len() - 1;
-        let last_block = &self.blocks[last_id];
-        let next_id = last_block.header.index + 1;
-        let prev_hash = last_block.hash();
-        let round = 0; // FIXME как менять round??
-
-        let mut new_block =
-            Block::build_unsigned(next_id, prev_hash, transactions, round, proposer_id);
-
-        new_block.sign(signer);
-        self.blocks.push(new_block);
+    fn add_block(&mut self, block: Block) {
+        self.blocks.push(block);
     }
 
     fn is_valid(&self) -> bool {
@@ -405,24 +422,6 @@ impl BlockChain {
             if cur_block.header.merkle_root != calc_merkle_root(&cur_block.transactions) {
                 return false;
             }
-
-            // FIXME перенести в консенсус?
-            // // проверка пропозера
-            // let (proposer_id, expected_proposer) =
-            //     consensus.expected_proposer(cur_block.header.index, cur_block.header.round);
-            // if cur_block.header.proposer_id != proposer_id {
-            //     return false;
-            // }
-            //
-            // // проверка подписи в конце, т.к. дороже
-            // let data = cur_block.header_wo_signature_to_bytes();
-            // if !verifier.verify(
-            //     &expected_proposer.pubkey,
-            //     &data,
-            //     &cur_block.header.signature,
-            // ) {
-            //     return false;
-            // };
         }
         true
     }
@@ -444,26 +443,70 @@ impl BlockChain {
     }
 }
 
-struct PoAConsensus {
+struct PoAConsensus<V: Verifier> {
     config: PoAConsensusConfig,
     state: PoAConsensusState,
+    verifier: V,
 }
 
-impl PoAConsensus {
+impl<V: Verifier> PoAConsensus<V> {
+    fn new(config: PoAConsensusConfig, state: PoAConsensusState, verifier: V) -> Result<Self, ConsensusError> {
+        if !config.validate_config() {
+            return Err(ConsensusError::InvalidConfig);
+        }
+        Ok(Self {
+            config,
+            state,
+            verifier,
+        })
+    }
     pub(crate) fn get_current_round(&self) -> u64 {
         self.state.current_round
     }
-}
 
-impl PoAConsensus {
-    fn new(config: PoAConsensusConfig, state: PoAConsensusState) -> Self {
-        Self { config, state }
+
+    fn update_state(&mut self, height: Option<u64>, round: u64 ) {
+        if let Some(h) = height {
+            self.state.current_height = h;
+        }
+        self.state.current_round = round;
+        self.state.round_started_at = Instant::now();
+    }
+
+    pub fn expected_proposer(&self, block_index: u64, round: u64) -> (u32, &Validator) {
+        debug_assert!(block_index > 0, "expected_proposer must not be called for genesis");
+
+        let proposer_count = self.config.validators.len();
+        let proposer_index = (block_index - 1 + round) % proposer_count as u64;
+        let validator = &self.config.validators[proposer_index as usize];
+        (proposer_index as u32, validator)
+    }
+
+    pub fn validate_block(&self, prev: &Block, current: &Block) -> Result<(), BlockError> {
+        current.validate(prev)?;
+
+        let (expected_proposer_id, expected_validator) =
+            self.expected_proposer(current.header.index, current.header.round);
+
+        if current.header.proposer_id != expected_proposer_id {
+            return Err(BlockError::InvalidProposer {
+                expected: expected_proposer_id,
+                got: current.header.proposer_id,
+            });
+        }
+
+        // проверка подписи в конце, т.к. дороже
+        let bytes = current.header_wo_signature_to_bytes();
+        let ok = self
+            .verifier
+            .verify(&expected_validator.pubkey, &bytes, &current.header.signature);
+        if !ok {
+            return Err(BlockError::InvalidSignature);
+        }
+
+        Ok(())
     }
 }
-
-// struct NodeConfig {
-//     private_key: [u8; 32],
-// }
 
 struct MemPool {
     /// очередь транзакиций на добавление в блок
@@ -515,7 +558,7 @@ impl NodeIdentity {
 
         Self {
             pubkey,
-            private_key: Some(signing_key),
+            private_key: node_id.map(|_| signing_key),
             node_id,
         }
     }
@@ -530,65 +573,164 @@ impl NodeIdentity {
 }
 
 impl Signer for NodeIdentity {
-    fn sign(&self, data: &[u8]) -> Option<SignatureType> {
-        self.private_key
-            .as_ref()
-            .map(|private_key| private_key.sign(data).to_bytes())
+    fn sign(&self, data: &[u8]) -> Result<SignatureType, SignError> {
+        let signing_key = self.private_key.as_ref().ok_or(SignError::NotValidator)?;
+        Ok(signing_key.sign(data).to_bytes())
     }
 }
 
-struct Node {
+struct Node<V: Verifier> {
     identity: NodeIdentity,
     chain: BlockChain,
     mempool: MemPool,
-    consensus: PoAConsensus,
+    consensus: PoAConsensus<V>,
 }
 
 enum NetMessage {
     Trx(Transaction),
     Block(Block),
+    Stop,
 }
-impl Node {
-    fn on_message(&mut self, message: NetMessage) {
-        match message {
-            NetMessage::Trx(message) => {
-                self.mempool.push(message);
-            }
-            NetMessage::Block(message) => {
-                // FIXME
-                // validate chain
-                // validate consensus
-                // append to chain
-            }
+impl<V: Verifier> Node<V> {
+    pub fn new(seed: [u8; 32], chain: BlockChain, consensus: PoAConsensus<V>) -> Self {
+        let identity = NodeIdentity::new(seed, &consensus.config);
+
+        let mempool = MemPool {
+            queue: VecDeque::new(),
+            seen: HashSet::new(),
+        };
+
+        Self {
+            identity,
+            chain,
+            mempool,
+            consensus,
         }
     }
 
-    fn build_block(&mut self, transactions: Vec<Transaction>) -> Option<Block> {
-        let proposer_id = self.identity.node_id?;
+    fn on_message(&mut self, message: NetMessage) {
+        match message {
+            NetMessage::Trx(trx) => { // прилетела транзакция
+                self.mempool.push(trx);
+            }
+            NetMessage::Block(block) => { // прилетел блок
+                // validate chain
+                let expected_index = self.chain.get_height() + 1;
+                if block.header.index != expected_index {
+                    // по взрослому тут должна быть какая то логика
+                    return;
+                }
+
+                // validate consensus
+                let prev = self.chain.last();
+                if self.consensus.validate_block(prev, &block).is_err() {
+                    return;
+                }
+
+                // append to chain
+                self.chain.add_block(block);
+
+                // update consensus state
+                let height = self.chain.get_height();
+                self.consensus.update_state(Some(height), 0);
+            }
+            NetMessage::Stop => {} // graceful shutdown
+        }
+    }
+
+    fn build_block(&mut self, transactions: Vec<Transaction>) -> Result<Block, SignError> {
+        let proposer_id = self.identity.node_id.ok_or(SignError::NotValidator)?;
         let last_block = self.chain.last();
         let next_block_id = last_block.header.index + 1;
         let prev_hash = last_block.hash();
         let round = self.consensus.get_current_round();
 
-        let mut new_block =
-            Block::build_unsigned(next_block_id, prev_hash, transactions, round, proposer_id);
+        let mut new_block = Block::build_unsigned(next_block_id, prev_hash, transactions, round, proposer_id);
+        let signer = &self.identity;
 
         new_block.sign(signer)?;
-
-        Some(new_block)
+        Ok(new_block)
     }
 
-    fn on_tick(&mut self) {
-        let transactions = self
-            .mempool
-            .pop_many(self.consensus.config.max_trx_per_block);
+    // выполняется если нет сообщений
+    pub fn on_tick(&mut self) {
+        // плохо, путано, потом переделать
+        let elapsed = self.consensus.state.round_started_at.elapsed();
+        if elapsed >= Duration::from_millis(self.consensus.config.timeout_ms) {
+            // плохо
+            let next_round = self.consensus.state.current_round.saturating_add(1);
+            self.consensus.update_state(None, next_round);
+        }
 
-        self.build_block(self.config.id, transactions, &self.config);
+        let next_height = self.chain.get_height() + 1;
+        let round = self.consensus.state.current_round;
+        let (expected_proposer_id, _) = self.consensus.expected_proposer(next_height, round);
+
+        if self.identity.node_id() != Some(expected_proposer_id) {
+            // я не я, очередь не моя
+            return;
+        }
+
+        let txs = self.mempool.pop_many(self.consensus.config.max_trx_per_block);
+        if txs.is_empty() {
+            // пустой блок без транзакций нельзя на всякий случай
+            return;
+        }
+
+        let candidate = match self.build_block(txs) {
+            Ok(b) => b,
+            Err(_) => return, // не валидатор / нет ключа
+        };
+
+        let prev = self.chain.last();
+        if self.consensus.validate_block(prev, &candidate).is_err() {
+            // кандидат не проходит правила консенсуса, не принимаем
+            return;
+        }
+
+        self.chain.blocks.push(candidate);
+
+        let cur_height = self.chain.get_height();
+        self.consensus.update_state(Some(cur_height), 0);
     }
 
-    fn run_loop(&self) {
-        thread_spawn()
+    // основной цикл работы ноды
+    pub fn run_loop(&mut self, rx: Receiver<NetMessage>) {
+        let tick_every = Duration::from_millis(100); // пока хардкод, можно вынести в конфиг
+        let mut next_tick = Instant::now() + tick_every;
+
+        loop {
+            let wait = next_tick.saturating_duration_since(Instant::now());
+
+            // растовый вариант каналов FIXME может можно иначе?
+            match rx.recv_timeout(wait) {
+                Ok(NetMessage::Stop) => break,
+                Ok(msg) => self.on_message(msg),
+                Err(RecvTimeoutError::Timeout) => {
+                    // тишина, переход на следующий тик
+                    self.on_tick();
+                    next_tick += tick_every;
+
+                    let now = Instant::now();
+                    if next_tick + tick_every < now {
+                        next_tick = now + tick_every;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    // источник сообщений умер?
+                    break;
+                }
+            }
+        }
     }
+}
+
+fn spawn_node<V: Verifier + Send + 'static>(mut node: Node<V>) -> (Sender<NetMessage>, thread::JoinHandle<()>) {
+    let (tx, rx) = channel::<NetMessage>();
+    let handle = thread::spawn(move || {
+        node.run_loop(rx);
+    });
+    (tx, handle)
 }
 
 fn main() {
