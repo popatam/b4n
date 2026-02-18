@@ -3,6 +3,24 @@ use serde_big_array::BigArray;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+/*
+mpsc почти каналы как в гошке (там mpmc), найти норм разбор сравнение FIXME
+
+// go
+ch := make(chan Message)
+go func() {
+    ch <- msg
+}()
+msg := <-ch
+
+// rust  https://doc.rust-lang.org/book/ch16-02-message-passing.html
+let (tx, rx) = channel::<Message>();
+std::thread::spawn(move || {
+    tx.send(msg).unwrap();
+});
+let msg = rx.recv().unwrap()
+
+ */
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -18,7 +36,6 @@ type PubkeyType = [u8; 32];
 type SignatureType = [u8; 64];
 const HEADER_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 8 + 4 + 64;
 const HEADER_WO_SIGN_CAPACITY_BYTES: usize = 4 + 8 + 32 + 32 + 8 + 8 + 4;
-const TRX_CAPACITY_BYTES: usize = 32;
 
 #[derive(Debug)]
 enum SignError {
@@ -352,13 +369,13 @@ struct Transaction {
     id: u64,
     from: u64, // не строка ли тут?
     to: u64,
-    amount: u64,
+    text: String,
     // created_at: SystemTime,  // пока без времени
 }
 
 impl Transaction {
-    fn new(id: u64, from: u64, to: u64, amount: u64) -> Transaction {
-        Transaction { id, from, to, amount }
+    fn new(id: u64, from: u64, to: u64, text: String) -> Transaction {
+        Transaction { id, from, to, text }
     }
 
     fn hash(&self) -> Hash32Type {
@@ -366,21 +383,8 @@ impl Transaction {
         calc_hash(&bytes)
     }
 
-    fn to_bytes(&self) -> [u8; TRX_CAPACITY_BYTES] {
-        let mut buf = [0u8; TRX_CAPACITY_BYTES];
-        let mut off = 0usize;
-
-        buf[off..off + 8].copy_from_slice(&self.id.to_be_bytes());
-        off += 8;
-        buf[off..off + 8].copy_from_slice(&self.from.to_be_bytes());
-        off += 8;
-        buf[off..off + 8].copy_from_slice(&self.to.to_be_bytes());
-        off += 8;
-        buf[off..off + 8].copy_from_slice(&self.amount.to_be_bytes());
-        off += 8;
-
-        debug_assert!(off == TRX_CAPACITY_BYTES);
-        buf
+    fn to_bytes(&self) -> Vec<u8> {
+        postcard::to_stdvec(&self).expect("Can't serialize transaction")
     }
 }
 
@@ -627,6 +631,215 @@ enum NetMessage {
         sender: Sender<NetMessage>,
     },
 }
+
+///// СЕТЬ
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+
+// то что ходит по сети
+#[derive(Debug, Serialize, Deserialize, Clone)]
+enum WireMessage {
+    GetStatus {
+        from: u32,
+    },
+    Status {
+        from: u32,
+        height: u64,
+        last_block_hash: Hash32Type,
+    },
+
+    GetBlocks {
+        from: u32,
+        start: u64,
+        limit: u32,
+    },
+    Blocks {
+        from: u32,
+        blocks: Vec<Block>,
+    },
+
+    Trx(Transaction),
+    Block(Block),
+}
+
+impl WireMessage {
+    /// преобразование из NetMessage того что можно отравлять по сети
+    fn from_net(msg: &NetMessage) -> Option<Self> {
+        match msg {
+            NetMessage::GetStatus { from } => Some(WireMessage::GetStatus { from: *from }),
+            NetMessage::Status {
+                from,
+                height,
+                last_block_hash,
+            } => Some(WireMessage::Status {
+                from: *from,
+                height: *height,
+                last_block_hash: *last_block_hash,
+            }),
+            NetMessage::GetBlocks { from, start, limit } => Some(WireMessage::GetBlocks {
+                from: *from,
+                start: *start,
+                limit: *limit,
+            }),
+            NetMessage::Blocks { from, blocks } => Some(WireMessage::Blocks {
+                from: *from,
+                blocks: blocks.clone(),
+            }),
+            NetMessage::Trx(t) => Some(WireMessage::Trx(t.clone())),
+            NetMessage::Block(b) => Some(WireMessage::Block(b.clone())),
+
+            // это не ходит
+            NetMessage::AddPeer { .. } => None,
+            NetMessage::DebugPrint => None,
+            NetMessage::Stop => None,
+        }
+    }
+
+    // и обратно
+    fn into_net(self) -> NetMessage {
+        match self {
+            WireMessage::GetStatus { from } => NetMessage::GetStatus { from },
+            WireMessage::Status {
+                from,
+                height,
+                last_block_hash,
+            } => NetMessage::Status {
+                from,
+                height,
+                last_block_hash,
+            },
+            WireMessage::GetBlocks { from, start, limit } => NetMessage::GetBlocks { from, start, limit },
+            WireMessage::Blocks { from, blocks } => NetMessage::Blocks { from, blocks },
+            WireMessage::Trx(t) => NetMessage::Trx(t),
+            WireMessage::Block(b) => NetMessage::Block(b),
+        }
+    }
+}
+
+fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+    let len_u32: u32 = payload
+        .len()
+        .try_into()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too big"))?;
+
+    stream.write_all(&len_u32.to_be_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_frame(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    // тупая защита от ООМ
+    const MAX_FRAME: usize = 16 * 1024 * 1024; // 16MB
+    if len > MAX_FRAME {
+        let error_msg = format!("frame bigger then {} bytes", MAX_FRAME);
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error_msg));
+    }
+
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn spawn_tcp_listener(bind_addr: &str, node_in_tx: Sender<NetMessage>) -> thread::JoinHandle<()> {
+    let addr = bind_addr.to_string();
+
+    thread::spawn(move || {
+        let listener = TcpListener::bind(&addr).expect("failed to bind tcp listener");
+        for incoming in listener.incoming() {
+            match incoming {
+                Ok(mut stream) => {
+                    let tx = node_in_tx.clone();
+                    let _ = stream.set_nodelay(true);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10))); // вынести в конфиг
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+
+                    thread::spawn(move || {
+                        loop {
+                            let frame = match read_frame(&mut stream) {
+                                Ok(f) => f,
+                                Err(_) => break, // сдох коннект или EOF или ещё чего
+                            };
+
+                            let wire: WireMessage = match postcard::from_bytes(&frame) {
+                                Ok(m) => m,
+                                Err(_) => continue, // мусор
+                            };
+
+                            let _ = tx.send(wire.into_net());
+                        }
+                    });
+                }
+                Err(_) => {
+                    // тут вероятно должна быть какая то логика
+                    continue;
+                }
+            }
+        }
+    })
+}
+
+fn connect_peer(peer_addr: &str) -> Sender<NetMessage> {
+    let (tx, rx) = channel::<NetMessage>();
+    let addr = peer_addr.to_string();
+
+    thread::spawn(move || {
+        // reconnect loop вместо backoff, разобраться как тут backoff носят
+        let mut stream = loop {
+            match TcpStream::connect(&addr) {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(10))); // вынести в конфиг
+                    let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
+                    break s;
+                }
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+            }
+        };
+
+        while let Ok(msg) = rx.recv() {
+            let Some(wire) = WireMessage::from_net(&msg) else {
+                // локальные управляющие сообщения не шлём по сети
+                continue;
+            };
+
+            let payload = match postcard::to_stdvec(&wire) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            if write_frame(&mut stream, &payload).is_err() {
+                // если коннект умер пытаемся переподключиться и продолжить
+                stream = loop {
+                    match TcpStream::connect(&addr) {
+                        Ok(s) => {
+                            let _ = s.set_nodelay(true);
+                            let _ = s.set_read_timeout(Some(Duration::from_secs(10))); // вынести в конфиг
+                            let _ = s.set_write_timeout(Some(Duration::from_secs(10)));
+                            break s;
+                        }
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(200));
+                            continue;
+                        }
+                    }
+                };
+            }
+        }
+    });
+
+    tx
+}
+
+/////
 
 impl<V: Verifier> Node<V> {
     pub fn new(net_id: u32, seed: [u8; 32], chain: BlockChain, consensus: PoAConsensus<V>) -> Self {
@@ -940,7 +1153,10 @@ impl<V: Verifier> Node<V> {
     }
 
     fn put_orphan(&mut self, block: Block) {
-        self.orphans_by_prev.entry(block.header.previous_hash).or_default().push(block);
+        self.orphans_by_prev
+            .entry(block.header.previous_hash)
+            .or_default()
+            .push(block);
     }
 
     // попытаться подключить бесхозные блоки
@@ -983,26 +1199,220 @@ fn spawn_node<V: Verifier + Send + 'static>(mut node: Node<V>) -> (Sender<NetMes
     (tx, handle)
 }
 
+///// CLI
+
+use std::env;
+
+#[derive(Debug)]
+struct CliArgs {
+    /// id ноды, вычисляет из seed
+    net_id: u32,
+    /// host:port
+    listen: String,
+    /// приватный ключ (вернее то из чего он вычисляется)
+    seed: [u8; 32],
+    /// открытые ключи валидаторов
+    validator_pubkeys: Vec<[u8; 32]>,
+    /// соседи
+    peers: Vec<(u32, String)>, // [(peer_id, "host:port")]
+}
+
+fn print_usage_and_exit() -> ! {
+    eprintln!(
+        "Usage:
+  --listen <ip:port>        tcp bind addr, пример: 0.0.0.0:7001
+  --seed <hex64>            приватный ключ (32 bytes hex)
+  --validator-pubkey <hex64>  публичный ключ валидатора (может быть несколько)
+  --peer <id@ip:port>       сосед в формате 2@10.0.0.12:7001 (может быть несколько)
+
+Пример
+  Node3:
+    --listen 0.0.0.0:7001 --seed <hex64_3> \\
+    --validator-pubkey <hex64_1> --validator-pubkey <hex64_2> --validator-seed <hex64_3> \\
+    --peer 1@10.0.0.11:7001 --peer 2@10.0.0.12:7001
+"
+    );
+    std::process::exit(2);
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_to_32(s: &str) -> Result<[u8; 32], String> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return Err(format!("seed must be 64 hex chars, got {}", bytes.len()));
+    }
+
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hex_val(bytes[2 * i]).ok_or_else(|| format!("invalid hex at pos {}", 2 * i))?;
+        let lo = hex_val(bytes[2 * i + 1]).ok_or_else(|| format!("invalid hex at pos {}", 2 * i + 1))?;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+fn parse_peer_spec(s: &str) -> Result<(u32, String), String> {
+    //  формат "2@10.0.0.12:7001"
+    let Some((id_str, addr)) = s.split_once('@') else {
+        return Err("peer must be in format <id@ip:port>".to_string());
+    };
+
+    let id: u32 = id_str.parse().map_err(|_| format!("invalid peer id '{}'", id_str))?;
+
+    if addr.trim().is_empty() {
+        return Err("peer addr is empty".to_string());
+    }
+
+    Ok((id, addr.to_string()))
+}
+
+fn parse_args() -> CliArgs {
+    let mut it = env::args().skip(1);
+
+    let mut net_id: Option<u32> = None;
+    let mut listen: Option<String> = None;
+    let mut seed: Option<[u8; 32]> = None;
+    let mut validator_pubkeys: Vec<[u8; 32]> = Vec::new();
+    let mut peers: Vec<(u32, String)> = Vec::new();
+
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--listen" => {
+                let v = it.next().unwrap_or_else(|| print_usage_and_exit());
+                listen = Some(v);
+            }
+            "--seed" => {
+                let v = it.next().unwrap_or_else(|| print_usage_and_exit());
+                seed = Some(hex_to_32(&v).unwrap_or_else(|_| print_usage_and_exit()));
+            }
+            "--validator-pubkey" => {
+                let v = it.next().unwrap_or_else(|| print_usage_and_exit());
+                let vs = hex_to_32(&v).unwrap_or_else(|_| print_usage_and_exit());
+                validator_pubkeys.push(vs);
+            }
+            "--peer" => {
+                let v = it.next().unwrap_or_else(|| print_usage_and_exit());
+                let p = parse_peer_spec(&v).unwrap_or_else(|_| print_usage_and_exit());
+                peers.push(p);
+            }
+            "--help" | "-h" => print_usage_and_exit(),
+            _ => {
+                eprintln!("unknown arg: {arg}");
+                print_usage_and_exit();
+            }
+        }
+    }
+
+    let listen = listen.unwrap_or_else(|| print_usage_and_exit());
+    let seed = seed.unwrap_or_else(|| print_usage_and_exit());
+    let net_id = u32::from_be_bytes(seed[0..4].try_into().unwrap()); // тут безопасно, т.к. seed уже распаковался
+
+    if validator_pubkeys.is_empty() {
+        eprintln!("at least one --validator-seed is required");
+        print_usage_and_exit();
+    }
+
+    // peer_id не должен совпадать с собой
+    for (pid, _) in &peers {
+        if *pid == net_id {
+            eprintln!("peer id must not be equal to own net-id ({net_id})");
+            print_usage_and_exit();
+        }
+    }
+
+    CliArgs {
+        net_id,
+        listen,
+        seed,
+        validator_pubkeys,
+        peers,
+    }
+}
+
+///// админко
+
+use std::io::{BufRead, BufReader};
+
+fn spawn_admin_listener(bind_addr: &str, node_tx: Sender<NetMessage>, from_id: u32) -> thread::JoinHandle<()> {
+    let addr = bind_addr.to_string();
+
+    thread::spawn(move || {
+        let listener = TcpListener::bind(&addr).expect("failed to bind admin listener");
+
+        for incoming in listener.incoming() {
+            let stream = match incoming {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            let tx = node_tx.clone();
+
+            thread::spawn(move || {
+                let mut next_trx_id: u64 = 1; // как и зачем нужн id в транзакциях
+                let reader = BufReader::new(stream);
+
+                for line in reader.lines() {
+                    let line = match line {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    };
+                    let cmd = line.trim();
+
+                    if cmd.is_empty() {
+                        continue;
+                    }
+
+                    if cmd == "print" {
+                        let _ = tx.send(NetMessage::DebugPrint);
+                        continue;
+                    }
+
+                    if cmd == "stop" {
+                        let _ = tx.send(NetMessage::Stop);
+                        break;
+                    }
+
+                    if let Some(rest) = cmd.strip_prefix("trx ") {
+                        let text = rest.trim().to_string();
+                        if text.is_empty() {
+                            continue;
+                        }
+
+                        let trx = Transaction::new(next_trx_id, from_id as u64, 0, text);
+                        next_trx_id = next_trx_id.saturating_add(1);
+
+                        let _ = tx.send(NetMessage::Trx(trx));
+                        continue;
+                    }
+                }
+            });
+        }
+    })
+}
+
+fn pubkey_from_seed(seed: [u8; 32]) -> PubkeyType {
+    let sk = SigningKey::from_bytes(&seed);
+    sk.verifying_key().to_bytes()
+}
+
 fn main() {
-    let seed1 = [1u8; 32];
-    let seed2 = [2u8; 32];
-    let seed3 = [3u8; 32];
+    let args = parse_args();
 
-    let signer1 = Ed25519Signer::new_from_seed(seed1);
-    let signer2 = Ed25519Signer::new_from_seed(seed2);
-    let signer3 = Ed25519Signer::new_from_seed(seed3);
-
-    let validators = vec![
-        Validator {
-            pubkey: signer1.pubkey(),
-        },
-        Validator {
-            pubkey: signer2.pubkey(),
-        },
-        Validator {
-            pubkey: signer3.pubkey(),
-        },
-    ];
+    let validators: Vec<Validator> = args
+        .validator_pubkeys
+        .iter()
+        .map(|&seed| Validator {
+            pubkey: pubkey_from_seed(seed),
+        })
+        .collect();
 
     let consensus_config = PoAConsensusConfig {
         validators,
@@ -1010,73 +1420,47 @@ fn main() {
         timeout_ms: 10_000,
         max_trx_per_block: 100,
     };
-    assert!(consensus_config.validate_config());
+    if !consensus_config.validate_config() {
+        eprintln!("invalid consensus config");
+        std::process::exit(254);
+    }
 
-    //
-    let chain1 = BlockChain::new(1);
-    let chain2 = BlockChain::new(1);
-    let chain3 = BlockChain::new(1);
+    // chain и консенсус
+    let chain = BlockChain::new(1);
+    let verifier = Ed25519Verifier;
 
-    let verifier1 = Ed25519Verifier;
-    let verifier2 = Ed25519Verifier;
-    let verifier3 = Ed25519Verifier;
-
-    let state1 = PoAConsensusState {
-        current_height: chain1.get_height(),
-        current_round: chain1.get_round(),
-        round_started_at: Instant::now(),
-    };
-    let state2 = PoAConsensusState {
-        current_height: chain2.get_height(),
-        current_round: chain2.get_round(),
-        round_started_at: Instant::now(),
-    };
-    let state3 = PoAConsensusState {
-        current_height: chain3.get_height(),
-        current_round: chain3.get_round(),
+    let state = PoAConsensusState {
+        current_height: chain.get_height(),
+        current_round: chain.get_round(),
         round_started_at: Instant::now(),
     };
 
-    let consensus1 = PoAConsensus::new(consensus_config.clone(), state1, verifier1).unwrap();
-    let consensus2 = PoAConsensus::new(consensus_config.clone(), state2, verifier2).unwrap();
-    let consensus3 = PoAConsensus::new(consensus_config.clone(), state3, verifier3).unwrap();
+    let consensus = PoAConsensus::new(consensus_config.clone(), state, verifier).unwrap();
 
-    let node1 = Node::new(1, seed1, chain1, consensus1);
-    let node2 = Node::new(2, seed2, chain2, consensus2);
-    let node3 = Node::new(3, seed3, chain3, consensus3);
+    // нода
+    let node = Node::new(args.net_id, args.seed, chain, consensus);
+    let (tx, join_handle) = spawn_node(node);
 
-    let (tx1, h1) = spawn_node(node1);
-    let (tx2, h2) = spawn_node(node2);
-    let (tx3, h3) = spawn_node(node3);
+    let _listener_handle = spawn_tcp_listener(&args.listen, tx.clone());
 
-    //
-    let _ = tx1.send(NetMessage::AddPeer {
-        peer_id: 2,
-        sender: tx2.clone(),
+    // админко
+    let admin_addr = "127.0.0.1:18000";
+    let _ = spawn_admin_listener(admin_addr, tx.clone(), args.net_id);
+
+    // connect peers
+    for (peer_id, peer_addr) in args.peers {
+        let _ = tx.send(NetMessage::AddPeer {
+            peer_id,
+            sender: connect_peer(&peer_addr),
+        });
+    }
+
+    let tx_clone = tx.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(1));
+        let trx_id = 1_000_000u64 + args.net_id as u64;
+        let _ = tx_clone.send(NetMessage::Trx(Transaction::new(trx_id, 0, 0, "i'm alive!".to_string())));
     });
-    let _ = tx2.send(NetMessage::AddPeer {
-        peer_id: 1,
-        sender: tx1.clone(),
-    });
-    let _ = tx3.send(NetMessage::AddPeer {
-        peer_id: 2,
-        sender: tx2.clone(),
-    });
 
-    let _ = tx1.send(NetMessage::Trx(Transaction::new(1, 0, 0, 0)));
-    let _ = tx2.send(NetMessage::Trx(Transaction::new(2, 0, 0, 0)));
-    let _ = tx3.send(NetMessage::Trx(Transaction::new(3, 0, 0, 0)));
-
-    thread::sleep(Duration::from_secs(2));
-    let _ = tx1.send(NetMessage::DebugPrint);
-    let _ = tx2.send(NetMessage::DebugPrint);
-    let _ = tx3.send(NetMessage::DebugPrint);
-
-    let _ = tx1.send(NetMessage::Stop);
-    let _ = tx2.send(NetMessage::Stop);
-    let _ = tx3.send(NetMessage::Stop);
-
-    let _ = h1.join();
-    let _ = h2.join();
-    let _ = h3.join();
+    let _ = join_handle.join();
 }
