@@ -8,7 +8,6 @@ pub enum BlockError {
     InvalidSignature,
 }
 
-
 #[derive(Debug)]
 pub enum SignError {
     NotValidator,

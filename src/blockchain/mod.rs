@@ -1,16 +1,15 @@
 pub(crate) mod block;
+pub mod consensus;
 pub mod crypto;
 pub mod errors;
 pub mod mempool;
 pub mod transaction;
-pub mod consensus;
-
 
 pub use block::{Block, BlockChain};
-pub use transaction::Transaction;
+pub use crypto::{Signer, Verifier};
 pub use errors::BlockError;
-pub use crypto::{Verifier, Signer};
 pub use mempool::MemPool;
+pub use transaction::Transaction;
 
 const VERSION: u32 = 0;
 pub type Hash32Type = [u8; 32];

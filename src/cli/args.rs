@@ -1,7 +1,7 @@
 use crate::blockchain::PubkeyType;
 use ed25519_dalek::SigningKey;
-use std::env;
 use getrandom::fill;
+use std::env;
 
 pub fn pubkey_from_seed(seed: [u8; 32]) -> PubkeyType {
     let sk = SigningKey::from_bytes(&seed);
@@ -91,8 +91,6 @@ fn gen_seed_and_print() -> ! {
 
     std::process::exit(0);
 }
-
-
 
 fn parse_peer_spec(s: &str) -> Result<(u32, String), String> {
     //  формат "2@10.0.0.12:7001"

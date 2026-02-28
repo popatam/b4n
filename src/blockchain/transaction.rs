@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use super::crypto::calc_hash;
 use super::Hash32Type;
+use super::crypto::calc_hash;
+use serde::{Deserialize, Serialize};
 
 // Транзакция, содержится в блоке, содержит id, от кого, кому и дату созадния, по идее ещё полезную ангрузку
 #[derive(Debug, Serialize, Deserialize, Clone)]
