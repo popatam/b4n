@@ -1,34 +1,8 @@
-use crate::blockchain::errors::{BlockError, SignError};
-use crate::blockchain::{Block, PubkeyType, SignatureType, Verifier, Signer};
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey, Signer as DalekSigner, Verifier as DalekVerifier};
+use crate::blockchain::errors::BlockError;
+use crate::blockchain::{Block, PubkeyType, SignatureType, Verifier};
+use ed25519_dalek::{Signature, Verifier as DalekVerifier, VerifyingKey};
 use std::collections::HashSet;
 use std::time::Instant;
-
-pub struct Ed25519Signer {
-    /// приватыный ключ ed25519
-    signing_key: SigningKey,
-}
-
-impl Ed25519Signer {
-    /// создать из сида
-    pub fn new_from_seed(seed: [u8; 32]) -> Self {
-        Self {
-            signing_key: SigningKey::from_bytes(&seed),
-        }
-    }
-
-    /// получить публичный ключ
-    pub fn pubkey(&self) -> PubkeyType {
-        self.signing_key.verifying_key().to_bytes()
-    }
-}
-
-impl Signer for Ed25519Signer {
-    fn sign(&self, data: &[u8]) -> Result<SignatureType, SignError> {
-        let sig: Signature = self.signing_key.sign(data);
-        Ok(sig.to_bytes())
-    }
-}
 
 /// Проверяет подпись по публичному ключу (Ed25519)
 #[derive(Default)]
@@ -61,7 +35,6 @@ impl Validator {
 #[derive(Debug)]
 pub enum ConsensusError {
     InvalidConfig,
-    GenesisNotAllowedHere,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +62,27 @@ impl PoAConsensusConfig {
             max_trx_per_block,
         }
     }
+
+    pub(crate) fn validate_config(&self) -> bool {
+        if self.validators.is_empty() {
+            return false;
+        }
+
+        let uniq_pubkeys = self
+            .validators
+            .iter()
+            .map(|v| v.pubkey)
+            .collect::<HashSet<PubkeyType>>();
+        if uniq_pubkeys.len() != self.validators.len() {
+            return false;
+        }
+
+        true
+    }
+
+    pub(crate) fn slot_duration_ms(&self) -> u64 {
+        self.slot_duration_ms
+    }
 }
 
 pub struct PoAConsensusState {
@@ -107,25 +101,6 @@ impl PoAConsensusState {
             current_round,
             round_started_at: Instant::now(),
         }
-    }
-}
-
-impl PoAConsensusConfig {
-    pub(crate) fn validate_config(&self) -> bool {
-        if self.validators.len() < 1 {
-            return false;
-        }
-
-        let uniq_pubkeys = self
-            .validators
-            .iter()
-            .map(|v| v.pubkey)
-            .collect::<HashSet<PubkeyType>>();
-        if uniq_pubkeys.len() != self.validators.len() {
-            return false;
-        }
-
-        true
     }
 }
 

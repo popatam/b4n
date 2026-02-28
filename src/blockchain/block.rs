@@ -87,6 +87,10 @@ impl Block {
         calc_hash(&bytes)
     }
 
+    pub fn transactions(&self) -> &[Transaction] {
+        &self.transactions
+    }
+
     fn header_to_bytes(&self) -> [u8; HEADER_CAPACITY_BYTES] {
         let mut buf = [0u8; HEADER_CAPACITY_BYTES];
         let mut off = 0usize;
@@ -195,8 +199,7 @@ impl BlockChain {
         self.blocks.push(block);
     }
 
-    // FIXME ГДЕЕЕ?????
-    fn is_valid(&self) -> bool {
+    pub fn is_valid(&self) -> bool {
         for block_window in self.blocks.windows(2) {
             let [prev_block, cur_block] = block_window else {
                 unreachable!();

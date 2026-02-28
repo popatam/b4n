@@ -1,6 +1,7 @@
-use std::env;
-use ed25519_dalek::SigningKey;
 use crate::blockchain::PubkeyType;
+use ed25519_dalek::SigningKey;
+use std::env;
+use getrandom::fill;
 
 pub fn pubkey_from_seed(seed: [u8; 32]) -> PubkeyType {
     let sk = SigningKey::from_bytes(&seed);
@@ -10,9 +11,11 @@ pub fn pubkey_from_seed(seed: [u8; 32]) -> PubkeyType {
 #[derive(Debug)]
 pub(crate) struct CliArgs {
     /// id ноды, вычисляет из seed
-    pub(crate) net_id: u32,
+    pub(crate) node_id: u32,
     /// host:port
     pub(crate) listen: String,
+    /// host:port админки
+    pub(crate) admin_listen: String,
     /// приватный ключ (вернее то из чего он вычисляется)
     pub(crate) seed: [u8; 32],
     /// открытые ключи валидаторов
@@ -24,6 +27,7 @@ pub(crate) struct CliArgs {
 fn print_usage_and_exit() -> ! {
     eprintln!(
         "Usage:
+  --gen-seed                генерация сида с последующим выходом
   --listen <ip:port>        tcp bind addr, пример: 0.0.0.0:7001
   --seed <hex64>            приватный ключ (32 bytes hex)
   --validator-pubkey <hex64>  публичный ключ валидатора (может быть несколько)
@@ -32,7 +36,7 @@ fn print_usage_and_exit() -> ! {
 Пример
   Node3:
     --listen 0.0.0.0:7001 --seed <hex64_3> \\
-    --validator-pubkey <hex64_1> --validator-pubkey <hex64_2> --validator-seed <hex64_3> \\
+    --validator-pubkey <hex64_1> --validator-pubkey <hex64_2> --validator-pubkey <hex64_3> \\
     --peer 1@10.0.0.11:7001 --peer 2@10.0.0.12:7001
 "
     );
@@ -63,6 +67,33 @@ fn hex_to_32(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const LOOKUP_TABLE: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(LOOKUP_TABLE[(b >> 4) as usize]);
+        out.push(LOOKUP_TABLE[(b & 0x0f) as usize]);
+    }
+    String::from_utf8(out).expect("hex is valid utf8")
+}
+
+// генерирует сид, ключ из него и id из него же
+fn gen_seed_and_print() -> ! {
+    let mut seed = [0u8; 32];
+    fill(&mut seed).expect("getrandom failed");
+
+    let pubkey = pubkey_from_seed(seed);
+    let node_id = u32::from_be_bytes([seed[0], seed[1], seed[2], seed[3]]);
+
+    println!("seed={}", bytes_to_hex(&seed));
+    println!("pubkey={}", bytes_to_hex(&pubkey));
+    println!("node_id={}", node_id);
+
+    std::process::exit(0);
+}
+
+
+
 fn parse_peer_spec(s: &str) -> Result<(u32, String), String> {
     //  формат "2@10.0.0.12:7001"
     let Some((id_str, addr)) = s.split_once('@') else {
@@ -85,9 +116,18 @@ pub(crate) fn parse_args() -> CliArgs {
     let mut seed: Option<[u8; 32]> = None;
     let mut validator_pubkeys: Vec<[u8; 32]> = Vec::new();
     let mut peers: Vec<(u32, String)> = Vec::new();
+    let mut gen_seed: bool = false;
+    let mut admin_listen: Option<String> = None;
 
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--gen-seed" => {
+                gen_seed = true;
+            }
+            "--admin" => {
+                let v = it.next().unwrap_or_else(|| print_usage_and_exit());
+                admin_listen = Some(v);
+            }
             "--listen" => {
                 let v = it.next().unwrap_or_else(|| print_usage_and_exit());
                 listen = Some(v);
@@ -114,29 +154,34 @@ pub(crate) fn parse_args() -> CliArgs {
         }
     }
 
+    if gen_seed {
+        gen_seed_and_print();
+    }
+
     let listen = listen.unwrap_or_else(|| print_usage_and_exit());
     let seed = seed.unwrap_or_else(|| print_usage_and_exit());
-    let net_id = u32::from_be_bytes(seed[0..4].try_into().unwrap()); // тут безопасно, т.к. seed уже распаковался
+    let node_id = u32::from_be_bytes(seed[0..4].try_into().unwrap()); // тут безопасно, т.к. seed уже распаковался
+    let admin_listen = admin_listen.unwrap_or_else(|| print_usage_and_exit());
 
     if validator_pubkeys.is_empty() {
-        eprintln!("at least one --validator-seed is required");
+        eprintln!("at least one --validator-pubkey is required");
         print_usage_and_exit();
     }
 
     // peer_id не должен совпадать с собой
     for (pid, _) in &peers {
-        if *pid == net_id {
-            eprintln!("peer id must not be equal to own net-id ({net_id})");
+        if *pid == node_id {
+            eprintln!("peer id must not be equal to own node_id ({node_id})");
             print_usage_and_exit();
         }
     }
 
     CliArgs {
-        net_id,
+        node_id,
         listen,
+        admin_listen,
         seed,
         validator_pubkeys,
         peers,
     }
 }
-

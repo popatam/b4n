@@ -1,14 +1,18 @@
-///// админко
-
+use super::node::NodeMessage;
+use crate::blockchain::Transaction;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
-use std::sync::mpsc::Sender;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+    mpsc::Sender,
+};
 use std::thread;
-use crate::blockchain::Transaction;
-use super::node::NodeMessage;
 
 pub fn spawn_admin_listener(bind_addr: &str, node_tx: Sender<NodeMessage>, from_id: u32) -> thread::JoinHandle<()> {
+    // тут бы какой нить axum больше подошёл бы
     let addr = bind_addr.to_string();
+    let global_next_trx_id = Arc::new(AtomicU64::new(1));
 
     thread::spawn(move || {
         let listener = TcpListener::bind(&addr).expect("failed to bind admin listener");
@@ -20,9 +24,9 @@ pub fn spawn_admin_listener(bind_addr: &str, node_tx: Sender<NodeMessage>, from_
             };
 
             let tx = node_tx.clone();
+            let global_next_trx_id = Arc::clone(&global_next_trx_id); // иначе хрень
 
             thread::spawn(move || {
-                let mut next_trx_id: u64 = 1; // как и зачем нужн id в транзакциях
                 let reader = BufReader::new(stream);
 
                 for line in reader.lines() {
@@ -52,10 +56,10 @@ pub fn spawn_admin_listener(bind_addr: &str, node_tx: Sender<NodeMessage>, from_
                             continue;
                         }
 
-                        let trx = Transaction::new(next_trx_id, from_id as u64, 0, text);
-                        next_trx_id = next_trx_id.saturating_add(1);
+                        let id = global_next_trx_id.fetch_add(1, Ordering::Relaxed);
+                        let trx = Transaction::new(id, from_id as u64, 0, text);
 
-                        let _ = tx.send(NodeMessage::Trx(trx));
+                        let _ = tx.send(NodeMessage::LocalTrx(trx));
                         continue;
                     }
                 }
