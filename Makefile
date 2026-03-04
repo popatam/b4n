@@ -141,7 +141,7 @@ stop:
 
 
 clean: stop
-	rm -rf $(LOG_DIR)
+	#rm -rf $(LOG_DIR)
 .PHONY: clean
 
 status1:
@@ -172,3 +172,8 @@ trx: text=$(or "hello", ${text})
 trx:
 	@echo "trx ${text}" | nc 127.0.0.1 $(ADMIN_PORT1)
 .PHONY: trx
+
+
+dbuild:
+	docker buildx build --platform linux/amd64 . -t b4n
+.PHONY: dbuild
