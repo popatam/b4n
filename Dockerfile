@@ -1,4 +1,4 @@
-FROM --platform=$TARGETPLATFORM rust:1.93-alpine AS build
+FROM rust:1.93-alpine AS build
 
 RUN apk add --no-cache \
       ca-certificates \
@@ -9,6 +9,7 @@ WORKDIR /usr/src/app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
+ARG TARGETPLATFORM
 ARG TARGETARCH
 # название бинарника из cargo.toml
 ARG BIN_NAME=b4n
@@ -33,13 +34,41 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETPLATFORM},target=/usr/local/car
     mkdir -p /out/zoneinfo; \
     cp -a /usr/share/zoneinfo/. /out/zoneinfo/
 
-
-FROM scratch
-
+###
+FROM scratch as node
 ENV TZ=Europe/Moscow
 
 COPY --from=build /out/app /app
 COPY --from=build /out/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/zoneinfo /usr/share/zoneinfo
 
+EXPOSE 7001
 ENTRYPOINT ["/app"]
+
+###
+FROM python:3.13-alpine AS web
+
+ENV TZ=Europe/Moscow
+ENV PYTHONUNBUFFERED=1
+
+RUN apk add --no-cache \
+      bash \
+      ca-certificates \
+      tzdata
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY --from=build /out/app /usr/local/bin/b4n
+COPY --from=build /out/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/zoneinfo /usr/share/zoneinfo
+COPY scripts/entrypoint.sh /entrypoint.sh
+COPY webapp ./webapp
+
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 7001 8080
+
+ENTRYPOINT ["/entrypoint.sh"]

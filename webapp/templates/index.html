@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>B4 Chat UI</title>
+  <link rel="stylesheet" href="{{ request.url_for('static', path='styles.css') }}">
+</head>
+<body data-poll-interval="{{ poll_interval_ms }}">
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">b4 blockchain monitor</p>
+        <h1>Чат ноды <span id="node-id">...</span></h1>
+        <p class="subtitle">Подтвержденные сообщения берутся из блокчейна, неподтвержденные из локального mempool текущей ноды.</p>
+      </div>
+      <dl class="stats">
+        <div class="stats__card">
+          <dt>confirmed</dt>
+          <dd id="confirmed-count">0</dd>
+        </div>
+        <div class="stats__card">
+          <dt>pending</dt>
+          <dd id="pending-count">0</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="chat-card">
+      <header class="chat-card__header">
+        <div>
+          <h2>Окно чата</h2>
+          <p id="status-line">Ожидание первого снимка состояния.</p>
+        </div>
+      </header>
+
+      <div id="chat-feed" class="chat-feed">
+        <div class="empty-state">История пока не загружена.</div>
+      </div>
+
+      <form id="chat-form" class="chat-form">
+        <label class="chat-form__label" for="message-input">Текст транзакции</label>
+        <textarea
+          id="message-input"
+          name="text"
+          rows="3"
+          maxlength="500"
+          placeholder="Введите сообщение, оно уйдет в транзакцию"
+          required
+        ></textarea>
+        <div class="chat-form__actions">
+          <span class="chat-form__hint">Одна строка, до 500 символов.</span>
+          <button id="send-button" type="submit">Отправить</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script src="{{ request.url_for('static', path='jquery-3.7.1.min.js') }}"></script>
+  <script src="{{ request.url_for('static', path='app.js') }}"></script>
+</body>
+</html>
